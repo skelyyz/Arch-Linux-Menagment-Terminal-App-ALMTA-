@@ -1,6 +1,7 @@
 #!/bin/bash
 
-LOGFILE="$HOME/arch-management.log"
+LOGFILE="$HOME/.local/logs/arch-management.log"
+mkdir -p "$(dirname "$LOGFILE")"
 
 # Colors
 RED="\e[31m"; GREEN="\e[32m"; YELLOW="\e[33m"; CYAN="\e[36m"; RESET="\e[0m"
@@ -10,25 +11,56 @@ ok() { echo -e "${GREEN}[OK]${RESET} $1" | tee -a "$LOGFILE"; }
 warn() { echo -e "${YELLOW}[WARN]${RESET} $1" | tee -a "$LOGFILE"; }
 
 # --------------------
-# SYSTEM MAINTENANCE FUNCTIONS
+# AUTO-INSTALL REQUIRED TOOLS (Official + AUR)
 # --------------------
+required_official=(nmcli speedtest-cli curl paccache pacdiff ufw openvpn wg flatpak fwupdmgr smartctl)
+required_aur=(checkrebuild)  # Add more AUR-only packages here
 
+auto_install_tools() {
+    log "Checking required official packages..."
+    for tool in "${required_official[@]}"; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            warn "$tool not found. Installing..."
+            case "$tool" in
+                nmcli) sudo pacman -S --noconfirm networkmanager && ok "NetworkManager installed" ;;
+                *) sudo pacman -S --noconfirm "$tool" && ok "$tool installed" ;;
+            esac
+        else
+            ok "$tool found"
+        fi
+    done
+
+    # Check AUR packages
+    if command -v paru >/dev/null; then
+        for aur_pkg in "${required_aur[@]}"; do
+            if ! command -v "$aur_pkg" >/dev/null 2>&1; then
+                warn "$aur_pkg not found. Installing from AUR..."
+                paru -S --noconfirm "$aur_pkg" && ok "$aur_pkg installed"
+            else
+                ok "$aur_pkg found"
+            fi
+        done
+    else
+        warn "AUR helper 'paru' not found. Skipping AUR package installation."
+    fi
+}
+
+auto_install_tools
+
+# --------------------
+# SYSTEM FUNCTIONS
+# --------------------
 pre_checks() {
     log "Running pre-checks..."
     ping -c 1 archlinux.org &>/dev/null || warn "No internet connection?"
-    if command -v checkupdates >/dev/null; then
-        updates=$(checkupdates 2>/dev/null | wc -l)
-        log "$updates packages pending update"
-    fi
+    updates=$(checkupdates 2>/dev/null | wc -l)
+    log "$updates packages pending update"
 }
 
 snapshot() {
     if command -v btrfs >/dev/null && mount | grep -q "on / type btrfs"; then
         read -rp "Create Btrfs snapshot? (y/N): " s
-        if [[ $s =~ ^[Yy]$ ]]; then
-            sudo btrfs subvolume snapshot / /.snapshots/pre-$(date +%F-%H%M)
-            ok "Snapshot created"
-        fi
+        [[ $s =~ ^[Yy]$ ]] && sudo btrfs subvolume snapshot / /.snapshots/pre-$(date +%F-%H%M) && ok "Snapshot created"
     elif command -v timeshift >/dev/null; then
         read -rp "Create Timeshift snapshot? (y/N): " s
         [[ $s =~ ^[Yy]$ ]] && sudo timeshift --create --comments "pre-update"
@@ -37,8 +69,8 @@ snapshot() {
 
 full_update() {
     log "Updating system..."
-    sudo pacman -Syu || return
-    command -v paru >/dev/null && paru -Sua
+    sudo pacman -Syu --noconfirm
+    command -v paru >/dev/null && paru -Sua --noconfirm
     command -v flatpak >/dev/null && flatpak update -y
     command -v fwupdmgr >/dev/null && sudo fwupdmgr refresh && sudo fwupdmgr update
     ok "System updated"
@@ -47,59 +79,30 @@ full_update() {
 cleanup() {
     log "Cleaning cache..."
     sudo paccache -r
-    log "Removing orphans..."
     orphan=$(pacman -Qtdq)
-    [ -n "$orphan" ] && sudo pacman -Rns $orphan
-    log "Cleaning logs..."
+    [ -n "$orphan" ] && sudo pacman -Rns --noconfirm $orphan
     sudo journalctl --vacuum-time=7d
     ok "Cleanup done"
 }
 
 post_checks() {
-    log "Checking .pacnew files..."
-    if command -v pacdiff >/dev/null; then
-        pacdiff --output
-    else
-        warn "Install pacman-contrib for pacdiff"
-    fi
-
-    if command -v checkrebuild >/dev/null; then
-        log "Checking AUR rebuilds..."
-        checkrebuild
-    else
-        warn "Install rebuild-detector for AUR rebuild checks"
-    fi
-
-    if command -v checkservices >/dev/null; then
-        log "Services needing restart:"
-        checkservices
-    else
-        warn "Install archlinux-contrib for service restart checks"
-    fi
-}
-
-health() {
-    log "Failed services:"
-    systemctl --failed
-    log "Disk usage:"
-    df -h /
-    log "Memory usage:"
-    free -h
-    log "Pacman cache size:"
-    sudo du -sh /var/cache/pacman/pkg 2>/dev/null
+    command -v pacdiff >/dev/null && pacdiff --output || warn "Install pacman-contrib for pacdiff"
+    command -v checkrebuild >/dev/null && checkrebuild || warn "Install rebuild-detector for AUR rebuilds"
+    command -v checkservices >/dev/null && checkservices || warn "Install archlinux-contrib for services check"
 }
 
 reboot_check() {
     KERNEL_AFTER=$(uname -r)
-    if [ "$KERNEL_BEFORE" != "$KERNEL_AFTER" ]; then
+    [[ "$KERNEL_BEFORE" != "$KERNEL_AFTER" ]] && {
         warn "Kernel updated → reboot recommended"
         read -rp "Reboot now? (y/N): " r
         [[ $r =~ ^[Yy]$ ]] && sudo reboot
-    else
-        ok "No reboot needed"
-    fi
+    } || ok "No reboot needed"
 }
 
+# --------------------
+# SYSTEM MAINTENANCE MENU
+# --------------------
 system_maintenance_menu() {
     while true; do
         clear
@@ -111,136 +114,172 @@ system_maintenance_menu() {
         echo "5) Back to Main Menu"
         echo "=============================="
         read -rp "Select option: " sys_choice
-
         KERNEL_BEFORE=$(uname -r)
-
         case "$sys_choice" in
-            1)
-                pre_checks
-                snapshot
-                full_update
-                cleanup
-                post_checks
-                reboot_check
-                ;;
-            2)
-                pre_checks
-                full_update
-                reboot_check
-                ;;
-            3)
-                cleanup
-                ;;
-            4)
-                health
-                ;;
-            5)
-                break
-                ;;
-            *)
-                warn "Invalid option. Choose 1-5."
-                ;;
+            1) pre_checks; snapshot; full_update; cleanup; post_checks; reboot_check ;;
+            2) pre_checks; full_update; reboot_check ;;
+            3) cleanup ;;
+            4) health_dashboard ;;
+            5) break ;;
+            *) warn "Invalid option. Choose 1-5." ;;
         esac
-
-        echo
         read -rp "Press Enter to continue..."
     done
 }
 
 # --------------------
-# NETWORK & INTERNET MANAGEMENT
+# NETWORK & VPN MENU
 # --------------------
-
 network_menu() {
     while true; do
         clear
         echo -e "${CYAN}===== Network & Internet Management =====${RESET}"
         echo "1) Show network status"
         echo "2) Restart network service"
-        echo "3) List available Wi-Fi networks"
+        echo "3) List Wi-Fi networks"
         echo "4) Connect to Wi-Fi"
         echo "5) Ping test"
         echo "6) Show public IP"
-        echo "7) Back to main menu"
+        echo "7) Speed test"
+        echo "8) VPN management"
+        echo "9) Firewall status"
+        echo "10) Remote Hosts (placeholder)"
+        echo "11) Back to main menu"
         echo "========================================="
         read -rp "Select option: " net_choice
-
         case "$net_choice" in
-            1)
-                log "Network status:"
-                nmcli general status
-                nmcli device status
-                read -rp "Press Enter to continue..."
-                ;;
-            2)
-                read -rp "Restart NetworkManager service? (y/N): " r
-                if [[ $r =~ ^[Yy]$ ]]; then
-                    sudo systemctl restart NetworkManager
-                    ok "NetworkManager restarted"
-                fi
-                read -rp "Press Enter to continue..."
-                ;;
-            3)
-                log "Scanning Wi-Fi networks..."
-                nmcli device wifi list
-                read -rp "Press Enter to continue..."
-                ;;
-            4)
-                read -rp "SSID: " ssid
-                read -rsp "Password: " pass
-                echo
-                nmcli device wifi connect "$ssid" password "$pass"
-                read -rp "Press Enter to continue..."
-                ;;
-            5)
-                read -rp "Ping host (default: 8.8.8.8): " host
-                host=${host:-8.8.8.8}
-                ping -c 4 "$host"
-                read -rp "Press Enter to continue..."
-                ;;
-            6)
-                log "Public IP:"
-                curl -s ifconfig.me
-                echo
-                read -rp "Press Enter to continue..."
-                ;;
-            7)
-                break
-                ;;
-            *)
-                warn "Invalid option. Choose 1-7."
-                ;;
+            1) nmcli general status; nmcli device status; read -rp "Enter to continue..." ;;
+            2) read -rp "Restart NetworkManager? (y/N): " r; [[ $r =~ ^[Yy]$ ]] && sudo systemctl restart NetworkManager && ok "NetworkManager restarted"; read -rp "Enter to continue..." ;;
+            3) nmcli device wifi list; read -rp "Enter to continue..." ;;
+            4) read -rp "SSID: " ssid; read -rsp "Password: " pass; echo; nmcli device wifi connect "$ssid" password "$pass"; read -rp "Enter to continue..." ;;
+            5) read -rp "Ping host (default 8.8.8.8): " host; host=${host:-8.8.8.8}; ping -c 4 "$host"; read -rp "Enter to continue..." ;;
+            6) log "Public IP:"; curl -s ifconfig.me; echo; read -rp "Enter to continue..." ;;
+            7) speedtest-cli; read -rp "Enter to continue..." ;;
+            8) vpn_menu ;;
+            9) sudo ufw status verbose || warn "Install/enable ufw"; read -rp "Enter to continue..." ;;
+            10) remote_hosts_menu ;;
+            11) break ;;
+            *) warn "Invalid option. Choose 1-11." ;;
         esac
     done
+}
+
+vpn_menu() {
+    while true; do
+        clear
+        echo -e "${CYAN}===== VPN Management =====${RESET}"
+        echo "1) Check VPN status"
+        echo "2) Connect OpenVPN"
+        echo "3) Connect WireGuard"
+        echo "4) Disconnect VPN"
+        echo "5) Back"
+        echo "==========================="
+        read -rp "Select option: " vpn_choice
+        case "$vpn_choice" in
+            1) systemctl status openvpn || wg show; read -rp "Enter to continue..." ;;
+            2) read -rp "Path to .ovpn file: " file; sudo openvpn --config "$file" ;;
+            3) read -rp "WireGuard interface name: " iface; sudo wg-quick up "$iface" ;;
+            4) read -rp "Interface or service to stop: " stop; sudo systemctl stop "$stop" || sudo wg-quick down "$stop"; read -rp "Enter to continue..." ;;
+            5) break ;;
+            *) warn "Invalid option. Choose 1-5." ;;
+        esac
+    done
+}
+
+remote_hosts_menu() {
+    echo -e "${CYAN}=== Remote Hosts Placeholder ===${RESET}"
+    echo "Feature coming soon: add remote SSH hosts for monitoring"
+    read -rp "Press Enter to return..."
+}
+
+# --------------------
+# HEALTH DASHBOARD
+# --------------------
+health_dashboard() {
+    clear
+    echo -e "${CYAN}===== System Health Dashboard =====${RESET}"
+    
+    CPU=$(top -bn1 | grep "Cpu(s)" | awk '{print $2 + $4}')
+    MEM_USED=$(free -m | awk '/Mem/ {print $3}')
+    MEM_TOTAL=$(free -m | awk '/Mem/ {print $2}')
+    
+    echo -e "CPU Usage: $CPU% "
+    printf "|"; for ((i=0;i<CPU/2;i++)); do printf "#"; done; echo
+    
+    echo -e "Memory Usage: $MEM_USED/$MEM_TOTAL MB"
+    MEM_BAR=$(( MEM_USED * 20 / MEM_TOTAL ))
+    printf "|"; for ((i=0;i<MEM_BAR;i++)); do printf "#"; done; echo
+    
+    echo -e "Disk Usage:"
+    df -h /
+    
+    echo -e "Network Status:"
+    nmcli -t -f DEVICE,STATE device
+    
+    echo -e "Pending Updates: $(checkupdates 2>/dev/null | wc -l)"
+    echo -e "Failed Services:"; systemctl --failed
+    
+    command -v smartctl >/dev/null && { echo -e "Disk SMART status:"; sudo smartctl -H /dev/sda; }
+    
+    read -rp "Press Enter to return..."
+}
+
+# --------------------
+# AUTO-MAINTENANCE SETUP
+# --------------------
+setup_auto_maintenance() {
+    echo -e "${CYAN}Do you want to enable weekly auto-maintenance?${RESET}"
+    read -rp "(updates + cleanup + health check) [y/N]: " a
+    [[ $a =~ ^[Yy]$ ]] && {
+        TIMER_PATH="$HOME/.config/systemd/user/arch-maintenance.timer"
+        SERVICE_PATH="$HOME/.config/systemd/user/arch-maintenance.service"
+        mkdir -p "$(dirname "$TIMER_PATH")"
+        cat > "$SERVICE_PATH" <<EOF
+[Unit]
+Description=Arch Maintenance Script
+
+[Service]
+Type=oneshot
+ExecStart=$HOME/.local/bin/arch-management --auto
+EOF
+        cat > "$TIMER_PATH" <<EOF
+[Unit]
+Description=Run Arch Maintenance Weekly
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+        systemctl --user daemon-reload
+        systemctl --user enable --now arch-maintenance.timer
+        ok "Weekly auto-maintenance enabled"
+    }
 }
 
 # --------------------
 # MAIN MENU
 # --------------------
-
 while true; do
     clear
-    echo -e "${CYAN}========== Arch Management v3 ==========${RESET}"
+    echo -e "${CYAN}========== Arch Management v5 ==========${RESET}"
     echo "1) System Maintenance"
     echo "2) Network & Internet Management"
-    echo "3) Exit"
+    echo "3) Health Dashboard"
+    echo "4) Setup Auto Maintenance (Optional)"
+    echo "5) Exit"
     echo "======================================="
     read -rp "Select option: " choice
 
     case "$choice" in
-        1)
-            system_maintenance_menu
-            ;;
-        2)
-            network_menu
-            ;;
-        3)
-            echo "Exiting..."
-            break
-            ;;
-        *)
-            warn "Invalid option. Choose 1-3."
-            ;;
+        1) system_maintenance_menu ;;
+        2) network_menu ;;
+        3) health_dashboard ;;
+        4) setup_auto_maintenance ;;
+        5) echo "Exiting..."; break ;;
+        *) warn "Invalid option. Choose 1-5." ;;
     esac
 done
 
